@@ -3,6 +3,9 @@
 import {workspace, window, languages, ExtensionContext, TextDocument, DocumentSelector, Position, commands, LanguageConfiguration, CompletionItemKind, CompletionItem, SnippetString, CompletionItemProvider, Hover, HoverProvider, Disposable, CancellationToken} from 'vscode';
 import util = require('util');
 import child_process = require("child_process");
+import fs = require('fs');
+import path = require('path');
+let cmakeParser = require('./cmake');
 
 /// strings Helpers
 function strContains(word, pattern) {
@@ -111,12 +114,12 @@ async function cmake_help_url() {
 
 
 // return the cmake command list
-function cmake_help_command_list(): Promise<string> {
-    return cmake(['--help-command-list']);
+function cmake_help_command_list(extra: string): Promise<string> {
+    return cmake(['--help-command-list']).then(d => d + extra);
 }
 
 function cmake_help_command(name: string): Promise<string> {
-    return cmake_help_command_list()
+    return cmake_help_command_list('')
         .then(function (result: string) {
             let contains = result.indexOf(name) > -1;
             return new Promise(function (resolve, reject) {
@@ -436,8 +439,8 @@ function cmPropetryInsertText(variable: string) {
     return variable.replace(/<(.*)>/g, '${1:<$1>}');
 }
 
-function cmCommandsSuggestions(currentWord: string): Thenable<CompletionItem[]> {
-    let cmd = cmake_help_command_list();
+function cmCommandsSuggestions(currentWord: string, extra: string): Thenable<CompletionItem[]> {
+    let cmd = cmake_help_command_list(extra);
     return suggestionsHelper(cmd, currentWord, 'function', cmFunctionInsertText, strContains);
 }
 
@@ -458,7 +461,7 @@ function cmModulesSuggestions(currentWord: string): Thenable<CompletionItem[]> {
 }
 
 function cmCommandsSuggestionsExact(currentWord: string): Thenable<CompletionItem[]> {
-    let cmd = cmake_help_command_list();
+    let cmd = cmake_help_command_list('');
     return suggestionsHelper(cmd, currentWord, 'function', cmFunctionInsertText, strEquals);
 }
 
@@ -484,6 +487,30 @@ class CMakeSuggestionSupport implements CompletionItemProvider {
 
 
     public provideCompletionItems(document: TextDocument, position: Position, token: CancellationToken): Thenable<CompletionItem[]> {
+        let statements = [];
+        let vcpkgRoot = this.findVcpkgRoot(document.fileName);
+        if (vcpkgRoot) {
+            let fileDir = path.dirname(document.fileName);
+            let portsDir = path.join(vcpkgRoot, 'ports');
+            let scriptsDir = path.join(vcpkgRoot, 'scripts');
+            let cmakeFunctionsDir = path.join(scriptsDir, 'cmake');
+            let tripletsDir = path.join(vcpkgRoot, 'triplets');
+            let tripletsCommunityDir = path.join(tripletsDir, 'community');
+            let portName = path.basename(fileDir);
+            let isPort = path.join(portsDir, portName) === fileDir;
+            let isPortFile = isPort && (path.basename(document.fileName) === 'portfile.cmake');
+            if (isPortFile) {
+                for (let triplet of this.readdirCMake(tripletsDir))
+                    statements = statements.concat(this.parseCMakeFile(path.join(tripletsDir, triplet)));
+                for (let triplet of this.readdirCMake(tripletsCommunityDir))
+                    statements = statements.concat(this.parseCMakeFile(path.join(tripletsCommunityDir, triplet)));
+                statements = statements.concat(this.parseCMakeFile(path.join(cmakeFunctionsDir, 'vcpkg_common_definitions.cmake')));
+                statements = statements.concat(this.parseCMakeFile(path.join(cmakeFunctionsDir, 'vcpkg_common_definitions.cmake')));
+                statements = statements.concat(this.parseCMakeFile(path.join(cmakeFunctionsDir, 'vcpkg_common_functions.cmake')));
+                statements = statements.concat(this.parseCMakeFile(document.fileName));
+            }
+        }
+
         let wordAtPosition = document.getWordRangeAtPosition(position);
         var currentWord = '';
         if (wordAtPosition && wordAtPosition.start.character < position.character) {
@@ -493,7 +520,7 @@ class CMakeSuggestionSupport implements CompletionItemProvider {
 
         return new Promise(function (resolve, reject) {
             Promise.all([
-                cmCommandsSuggestions(currentWord),
+                cmCommandsSuggestions(currentWord, statements.filter(a => a.command === 'function').map(a => a.args[0]).join('\n') + '\n'),
                 cmVariablesSuggestions(currentWord),
                 cmPropertiesSuggestions(currentWord),
                 cmModulesSuggestions(currentWord)
@@ -511,6 +538,53 @@ class CMakeSuggestionSupport implements CompletionItemProvider {
             item.documentation = result.split('\n')[3];
             return item;
         });
+    }
+
+    private findVcpkgRoot(fileName: string): string {
+        if (!fileName) return null;
+        let dir1 = fileName;
+        let dir2 = path.dirname(dir1);
+        while (dir1 !== dir2) {
+            let vcpkgRoot = path.join(dir2, '.vcpkg-root');
+            if (fs.existsSync(vcpkgRoot))
+                return dir2;
+            dir1 = dir2;
+            dir2 = path.dirname(dir1);
+        }
+        return null;
+    }
+
+    private readdirCMake(dir): string[] {
+        let files = fs.readdirSync(dir, { withFileTypes: true });
+        return files.filter(a => a.isFile()).map(a => a.name);
+    }
+
+    private parseCMakeFile(fileName: string): object[] {
+        if (!fs.existsSync(fileName))
+            return [];
+        let dir = path.dirname(fileName);
+        let content = fs.readFileSync(fileName, 'utf-8');
+        let result = [];
+        try {
+            let statements = cmakeParser(content);
+            for (let statement of statements) {
+                if (statement.type !== 0) continue;
+                if (statement.command === 'include') {
+                    let subFile = statement.args[0];
+                    if (!subFile.endsWith('.cmake'))
+                        subFile += '.cmake';
+                    subFile = path.join(dir, subFile);
+                    let result2 = this.parseCMakeFile(subFile);
+                    result = result.concat(result2);
+                } else if (statement.command === 'function') {
+                    result.push(statement);
+                } else if (statement.command === 'macro') {
+                    result.push(statement);
+                }
+            }
+        } catch (e) {
+        }
+        return result;
     }
 }
 
